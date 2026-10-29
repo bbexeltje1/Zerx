@@ -13,7 +13,68 @@
 
 (() => {
   "use strict";
-  const P = ZSProvider;
+
+  // ── Provider readiness check ──────────────────────────────────────────────
+  // Every ZeroScript provider is an ORDINARY agent provider: the interface below
+  // (also documented at the top of providers/deepseek.js). A build whose provider
+  // is not one - a stale/patched copy, or a "prompt generator only" variant -
+  // used to fail the worst possible way: this IIFE died on a bare TypeError
+  // somewhere inside an async sweep, so the page had NO bar and no explanation
+  // ("the Start Roblox agent control is just gone"). Check the interface FIRST and
+  // say so on the page instead of half-booting: a bar that cannot start an agent
+  // is worse than a bar that says why. test-agent-startup.js reads this list back
+  // out of the file and asserts every shipped provider implements all of it.
+  const REQUIRED_PROVIDER_API = [
+    // identity + lifecycle
+    "id", "displayName", "timings", "init",
+    // turns: enumerate, classify, read
+    "allItems", "isUserItem", "isAssistantItem", "itemText", "classifyText",
+    "assistantCount", "userCount", "lastAssistant", "readAssistant", "snapshot",
+    "streamLen",
+    // chat state (the Start gate keys off these)
+    "chatIsEmpty", "isFreshChat", "conversationKey",
+    // composer: read, lock, type+submit
+    "getEditor", "editorText", "composerFrame", "setInputLock", "enforceComposer",
+    "ensureComposerReady", "typeAndSend", "stopGeneration",
+    // generation + error surfaces the loop waits on
+    "isGenerating", "isBusyNow", "isHardGenerating", "turnHalted",
+    "findContinueBtn", "clickContinueBtn",
+    "scanError", "isTooLongMsg", "isBusyMsg",
+    // hooks + the camouflage matcher
+    "installSendHooks", "findToolBlockSpot", "supportsVision",
+  ];
+
+  function providerFatal(detail) {
+    const msg = `ZeroScript could not start: ${detail}`;
+    try { console.error("[zeroscript]", msg); } catch {}
+    try {
+      const el = document.createElement("div");
+      el.id = "zs-provider-fatal";
+      el.textContent = msg;
+      el.style.cssText = "position:fixed;z-index:2147483647;top:12px;right:12px;max-width:380px;" +
+        "padding:10px 14px;border-radius:10px;background:#3a1114;color:#ffd9d9;" +
+        "border:1px solid #7a2b31;font:12px/1.45 system-ui,-apple-system,'Segoe UI',sans-serif;" +
+        "box-shadow:0 6px 24px rgba(0,0,0,.35);";
+      const add = () => (document.body || document.documentElement).appendChild(el);
+      if (document.body) add();
+      else document.addEventListener("DOMContentLoaded", add, { once: true });
+    } catch {}
+  }
+
+  // eslint-disable-next-line no-undef
+  const P = typeof ZSProvider !== "undefined" ? ZSProvider : null;
+  if (!P) {
+    providerFatal("the provider script did not load - check the content_scripts order in manifest.json.");
+    return;
+  }
+  const missingApi = REQUIRED_PROVIDER_API.filter((k) => typeof P[k] === "undefined");
+  if (missingApi.length) {
+    providerFatal(`the "${P.id || "unknown"}" provider is not a ZeroScript agent provider ` +
+      `(missing ${missingApi.length}: ${missingApi.join(", ")}). Reinstall the extension from a ` +
+      `build that ships with the standard providers/*.js files.`);
+    return;
+  }
+
   const T = P.timings;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const log = (...a) => console.log("[zeroscript]", ...a);
@@ -3369,6 +3430,28 @@
       if (anchorPadEl) { try { anchorPadEl.style.paddingTop = ""; } catch {} anchorPadEl = null; }
     }
 
+    // Why is the bar not on screen? placeBar decides that every frame, and when
+    // the answer is "we could not resolve a composer" the bar simply vanishes -
+    // which is exactly the 2026-10-29 report (bar present, Start button correct
+    // and enabled, `#zs-bar` at display:none / 0x0 because ChatGPT's composer no
+    // longer matched #prompt-textarea). Report it through [zs-diag] so the next
+    // such report can be answered from the console instead of a devtools session.
+    // Throttled: placeBar runs every animation frame.
+    let lastHideReason = "", lastHideAt = 0;
+    function noteBarHidden(reason) {
+      if (reason === lastHideReason && Date.now() - lastHideAt < 10000) return;
+      lastHideReason = reason; lastHideAt = Date.now();
+      let editor = null, frame = null;
+      try { editor = P.getEditor ? !!P.getEditor() : null; } catch {}
+      try { frame = P.composerFrame ? !!P.composerFrame() : null; } catch {}
+      diag("bar.hidden", { reason, editor, frame });
+    }
+    function noteBarShown() {
+      if (!lastHideReason) return;
+      lastHideReason = ""; lastHideAt = 0;
+      diag("bar.shown", {});
+    }
+
     // Position the floating "⚠ unstable" pill just above the bar's left edge.
     function placeUnstable() {
       const u = unstableEl;
@@ -3415,6 +3498,7 @@
         bar.style.display = "none";
         clearAnchorPad();
         if (menuEl) menuEl.hidden = true;
+        noteBarHidden("captcha-or-overlay");
         return;
       }
 
@@ -3433,6 +3517,7 @@
         // when mounted ABOVE it. The provider's barMount() signals which via .inside.
         bar.classList.toggle("zs-bar-inside", !!mount.inside);
         bar.style.display = "flex";
+        noteBarShown();
         if (menuEl && !menuEl.hidden) {
           const br = bar.getBoundingClientRect();
           menuEl.style.right = Math.round(window.innerWidth - br.right) + "px";
@@ -3456,8 +3541,9 @@
         bar.classList.add("zs-bar-anchored");
         if (root && bar.parentElement !== root) root.appendChild(bar);
         const r = anchorEl.getBoundingClientRect();
-        if (!r.width) { bar.style.display = "none"; clearAnchorPad(); if (menuEl) menuEl.hidden = true; return; }
+        if (!r.width) { bar.style.display = "none"; clearAnchorPad(); if (menuEl) menuEl.hidden = true; noteBarHidden("anchor-zero-width"); return; }
         bar.style.display = "flex";
+        noteBarShown();
         const bh = bar.offsetHeight || 34;
         if (anchorPadEl && anchorPadEl !== anchorEl) clearAnchorPad();
         anchorPadEl = anchorEl;
@@ -3483,10 +3569,10 @@
         if (root && bar.parentElement !== root) root.appendChild(bar);
       }
       const f = (P.getEditor && P.getEditor()) || (P.composerFrame && P.composerFrame());
-      if (!f) { bar.style.display = "none"; if (menuEl) menuEl.hidden = true; return; }
+      if (!f) { bar.style.display = "none"; if (menuEl) menuEl.hidden = true; noteBarHidden("no-composer"); return; }
       bar.style.display = "flex";
       const r = f.getBoundingClientRect();
-      if (!r.width) { bar.style.display = "none"; return; }
+      if (!r.width) { bar.style.display = "none"; noteBarHidden("zero-width-composer"); return; }
       const w = Math.min(r.width, BAR_MAX_W);
       const left = Math.round(r.left + (r.width - w) / 2);
       const bh = bar.offsetHeight || 40;
@@ -3494,6 +3580,7 @@
       bar.style.width = w + "px";
       bar.style.left = left + "px";
       bar.style.top = top + "px";
+      noteBarShown();
       // Keep the open "more" menu anchored to the bar, opening upward.
       if (menuEl && !menuEl.hidden) {
         const br = bar.getBoundingClientRect();
