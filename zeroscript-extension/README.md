@@ -67,8 +67,36 @@ Smoke tests (plain Node, no dependencies - run them from this directory):
 - `node test-chatgpt.js` - ChatGPT reply reading (`providers/chatgpt.js`),
   driven against a stub DOM: CodeMirror line joining, the `data-zs-cm`
   MAIN-world tap that long code blocks depend on, and subtree exclusion.
+- `node test-agent-startup.js` - the standalone agent startup path: every
+  provider implements the full `ZSProvider` contract the core declares
+  (`REQUIRED_PROVIDER_API`), the bar renders a Start control that routes to the
+  ordinary bootstrap (`startSession()` -> `list_tools` -> system prompt ->
+  `provider.typeAndSend()`), and nothing in the standalone path asks for a
+  dashboard, pairing, handoff or "prompt architect" mode. It also drives the
+  ChatGPT adapter end to end against a fake composer (the bootstrap prompt is
+  typed in and the send control is clicked exactly once).
+- `node test-manifest.js` - `manifest.json`: MV3 shape, host permissions, script
+  order per site (`config -> parser -> provider -> main`), every referenced file
+  exists, and the manifest / background / popup / in-page switcher host lists
+  agree.
 
-Both print `PASS`/`FAIL` per case and exit non-zero on failure.
+All of them print `PASS`/`FAIL` per case and exit non-zero on failure. They are
+mocked tests: a stub DOM and a stubbed bridge, never a live ChatGPT tab or
+Roblox Studio.
+
+For a whole-chain check without a signed-in browser (bar -> Start control ->
+bootstrap -> provider send) there is an optional jsdom probe, which needs jsdom
+installed outside the repo:
+
+```
+mkdir -p /tmp/zs-probe && cd /tmp/zs-probe && npm init -y && npm i jsdom
+NODE_PATH=/tmp/zs-probe/node_modules \
+  node <repo>/zeroscript-extension/tools/probe-chatgpt-start.js
+```
+
+It reports the control it found, the diag events the click produced and the
+messages sent to the bridge. Its page is synthetic and its bridge is a stub, so
+it is still not a live verification.
 
 ## Support
 
