@@ -162,6 +162,8 @@ function el(tag, opts, children) {
     },
     addEventListener() {},
     dispatchEvent() { return true; },
+    __clicks: 0,
+    click() { node.__clicks++; if (node.__onClick) node.__onClick(); },
     focused: false,
     focus() { node.focused = true; },
   };
@@ -218,6 +220,7 @@ const legacyComposer = () =>
     el("div", { class: "prosemirror-parent", attrs: { "data-testid": "composer" } }, [
       el("div", { id: "prompt-textarea", class: "ProseMirror", attrs: { contenteditable: "true" } }),
     ]),
+    el("button", { id: "composer-submit-button", attrs: { "data-testid": "send-button" } }, ["Send"]),
   ]);
 
 // The 2026-09 signed-in shell: no id, no composer-surface, the editor is a
@@ -231,6 +234,8 @@ const modernComposer = (opts) => {
         attrs: Object.assign({ contenteditable: "true" }, o.role === false ? {} : { role: "textbox" }),
       }),
     ]),
+    // The current build's send control: no id, no testid - just a submit button.
+    el("button", { attrs: { type: "submit", "aria-label": "Send" } }, ["Send"]),
   ]);
 };
 
@@ -412,11 +417,10 @@ const modernComposer = (opts) => {
       else if (cmd === "insertLineBreak") ed.textContent += "\n";
       return true;
     };
-    doc.querySelector = (sel) => (String(sel).includes("composer-submit-button") ? {
-      disabled: false, offsetParent: {}, getAttribute: () => "send-button", click() { clicks.push(1); },
-    } : doc.querySelector(sel));
+    const btn = doc.querySelector("#composer-submit-button, button[type='submit']");
     await P.typeAndSend("###LUA###\nreturn 1\n###END_LUA###");
     ok(`${label}: the composer receives the injected text`, /###LUA###/.test(ed.textContent));
-    ok(`${label}: the send control is clicked once`, clicks.length === 1, `clicks=${clicks.length}`);
+    ok(`${label}: the send control is clicked once`, !!btn && btn.__clicks === 1,
+      `clicks=${btn ? btn.__clicks : "no button"}`);
   }
 })();

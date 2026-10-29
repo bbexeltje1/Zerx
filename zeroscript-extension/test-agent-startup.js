@@ -253,6 +253,8 @@ ok("startup asks the bridge for the tool catalogue",
     addEventListener() {},
   };
   const sendBtn = {
+    nodeType: 1,
+    tagName: "BUTTON",
     disabled: false,
     offsetParent: {}, // visible (the provider checks offsetParent !== null)
     attrs: { "data-testid": "send-button" },
@@ -267,7 +269,8 @@ ok("startup asks the bridge for the tool catalogue",
   const stub = makeStub({
     document: {
       querySelector: (sel) => (isEditorSel(sel) ? editor : sel.includes("composer-submit-button") ? sendBtn : null),
-      querySelectorAll: (sel) => (isEditorSel(sel) ? [editor] : []),
+      querySelectorAll: (sel) => (isEditorSel(sel) ? [editor]
+        : String(sel).includes("composer-submit-button") ? [sendBtn] : []),
       execCommand: (cmd, _ui, val) => {
         if (cmd === "insertText") editor.textContent += val || "";
         else if (cmd === "insertLineBreak") editor.textContent += "\n";

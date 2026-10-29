@@ -71,17 +71,19 @@ const ZSProvider = (() => {
     msg: "[data-message-author-role]",
     userRole: "user",
     assistantRole: "assistant",
-    reply: ".markdown",
+    // The assistant body. `.markdown` is the legacy container; the 2026-09 shell
+    // renders it as a CSS-module `MarkdownRoot-<hash>` div, so both are matched
+    // (case-sensitive class names: ChatGPT still uses "Markdown…").
+    reply: ".markdown, [class*='MarkdownRoot'], [class*='markdown']",
     // The composer editor. Not a single selector any more - see EDITOR_CANDIDATES
     // and getEditor() below for why (ChatGPT dropped #prompt-textarea in the
     // 2026-09 "Chat / Work" redesign).
     editor: "#prompt-textarea",
-    // The ONE submit control; its data-testid says whether it is currently a
-    // send or a stop button (see isStopBtn). Id first - it survives testid churn.
+    // Legacy submit/stop controls. The current build ships neither an id nor a
+    // testid (see isStopBtn/isSendLike/composerButtons): these selectors are the
+    // fast path for accounts still on the old markup, and the composer form is
+    // scanned for the rest.
     submitBtn: "#composer-submit-button, button[data-testid='send-button'], button[data-testid='stop-button']",
-    // Kept for installSendHooks, which needs to recognise a click on the native
-    // stop control wherever it lives.
-    stopBtn: "button[data-testid='stop-button']",
     codeWrap: "pre",
     // composer frame: the <form> that wraps the ProseMirror editor.
     errorSurfaces: '[role="alert"],[data-testid*="error"],[class*="error-message"]',
@@ -123,9 +125,76 @@ const ZSProvider = (() => {
   };
 
   // ── Turn classification ───────────────────────────────────────────────────
-  const role = (item) => (item && item.getAttribute ? item.getAttribute("data-message-author-role") : null);
-  const isUserItem = (item) => role(item) === S.userRole;
-  const isAssistantItem = (item) => role(item) === S.assistantRole;
+  // ONE "item" = one COMPLETE conversation turn. ChatGPT has shipped two DOM
+  // generations and BOTH must work, because the account/build decides which one
+  // it gets:
+  //
+  //  legacy (older builds, mobile) - the message element IS the turn:
+  //    <div data-message-author-role="user|assistant" data-message-id="…">
+  //      <div class="markdown">…</div>
+  //    </div>
+  //
+  //  current (2026-09 "Chat / Work" redesign) - a CONTAINER is the turn and the
+  //  role is carried by markers INSIDE it, not on the container:
+  //    <div data-turn-key="…">
+  //      <div data-user-message-bubble="true">…</div>                  (user)
+  //      <h4 data-conversation-role="assistant">ChatGPT said:</h4>      (assistant)
+  //      <div class="MarkdownRoot-…">…</div>
+  //    </div>
+  //
+  // WHY IT MATTERS: with only the legacy attribute, allItems() returned [] on the
+  // current build. The adapter then reported zero turns - so the core could not
+  // camouflage the ⟦ZS-SYS⟧ bootstrap (it iterates allItems()), could not see the
+  // model's {"command":"list_commands"} reply (lastAssistant() was null, so
+  // waitForResponse() timed out) and could not inject/see the result. That is the
+  // "bootstrap stays visible and commands never run" report.
+  //
+  // ROLE DETECTION IS STRUCTURAL, never text: labels like "You said:" are
+  // localized, so only attributes and dedicated marker elements are trusted.
+  // A node whose role cannot be established is NOT a turn - better a missing turn
+  // plus a diagnostic than a heading or an editor counted as a message.
+  const ROLE_ATTRS = ["data-message-author-role", "data-conversation-role", "data-turn", "data-author"];
+  const ROLE_VALUE_SEL = ROLE_ATTRS.map((a) => `[${a}='user'],[${a}='assistant']`).join(",");
+  const USER_MARKER_SEL = "[data-user-message-bubble]";
+  const ASSISTANT_MARKER_SEL = "[data-conversation-role='assistant']";
+  // A container turn: the element that wraps one whole message. `data-turn-key` is
+  // the current build; the testid form is the 2024-2026 one; keep both.
+  const TURN_CONTAINER_SEL = "[data-turn-key],[data-testid^='conversation-turn-']";
+  // Every node that may BE a turn, in priority order (containers first so the
+  // legacy element nested inside one is dropped instead of counted twice).
+  const LEGACY_TURN_SEL = S.msg;
+
+  const roleOfAttr = (el) => {
+    for (const a of ROLE_ATTRS) {
+      const v = el.getAttribute(a);
+      if (v === "user" || v === "assistant") return v;
+    }
+    return null;
+  };
+  // Cached per NODE: a turn's role never changes, and allItems()/isAssistantItem()
+  // run several times per sweep. Unknown results are never cached, so a container
+  // first seen before its content rendered is re-examined next time.
+  const ROLE_CACHE = new WeakMap();
+  function roleOf(item) {
+    if (!item || item.nodeType !== 1) return null;
+    const hit = ROLE_CACHE.get(item);
+    if (hit) return hit;
+    let role = roleOfAttr(item);
+    if (!role) {
+      // Container: the first classified marker inside it decides. (A container
+      // holding both would be malformed; DOM order is the tie-breaker.)
+      const inner = item.querySelector ? item.querySelector(ROLE_VALUE_SEL) : null;
+      if (inner) role = roleOfAttr(inner);
+    }
+    if (!role && item.querySelector) {
+      if (item.querySelector(USER_MARKER_SEL)) role = "user";
+      else if (item.querySelector(ASSISTANT_MARKER_SEL)) role = "assistant";
+    }
+    if (role) ROLE_CACHE.set(item, role);
+    return role;
+  }
+  const isUserItem = (item) => roleOf(item) === S.userRole;
+  const isAssistantItem = (item) => roleOf(item) === S.assistantRole;
 
   // Text extraction that can skip our own chip (and any excluded subtree).
   //
@@ -206,26 +275,138 @@ const ZSProvider = (() => {
   // Non-reasoning reply text only: join the .markdown container(s). Reasoning
   // renders outside .markdown, so this never sees tool blocks the model merely
   // drafts while thinking.
+  //
+  // CHROME: on the container markup the turn also holds a role heading ("You
+  // said:" / "ChatGPT said:"), copy/feedback buttons and screen-reader labels.
+  // Those must never reach the parser: ZSParse.isInjectedFeedback() anchors on
+  // the START of the text ("Output of '…'"), so one leading label would make an
+  // injected result invisible to the core. Replies are therefore read from the
+  // reply root only, and user turns from the message bubble, with UI chrome
+  // excluded as a belt-and-braces.
+  const CHROME_SEL = "button,svg,[role='button'],[role='img'],script,style," +
+    "[data-testid*='copy'],[data-testid*='feedback'],[data-testid*='voice']," +
+    "[class*='sr-only'],[aria-hidden='true']";
+  const withChrome = (sel) => (sel ? `${CHROME_SEL},${sel}` : CHROME_SEL);
+  const hasOwnRole = (item) => !!roleOfAttr(item);
+  // The reply containers of an assistant turn, de-duplicated (a nested .markdown
+  // inside another would otherwise contribute its text twice).
+  function replyRoots(item) {
+    if (!item || !item.querySelectorAll) return [];
+    const all = [...item.querySelectorAll(S.reply)];
+    return all.filter((r) => !all.some((o) => o !== r && o.contains(r)));
+  }
+  // The element that actually holds a turn's text.
+  function contentRoot(item) {
+    if (!item) return null;
+    if (isAssistantItem(item)) return replyRoots(item)[0] || item;
+    return (item.querySelector && item.querySelector(USER_MARKER_SEL)) || item;
+  }
+
   function itemText(item) {
     if (!item) return "";
-    if (isAssistantItem(item)) {
-      // textWithout, never textContent - see the CodeMirror note there.
-      return [...item.querySelectorAll(S.reply)].map((m) => textWithout(m)).join("\n");
-    }
-    return textWithout(item);
+    const root = contentRoot(item);
+    if (root !== item) return textWithout(root);
+    // The turn element itself carries the text: legacy message elements read
+    // exactly as before (no excluded chrome), container turns get the chrome
+    // selector so headings/buttons never leak into the parser.
+    return textWithout(item, hasOwnRole(item) ? undefined : CHROME_SEL);
   }
 
   function classifyText(item, excludeSel) {
+    if (!item) return "";
     if (isAssistantItem(item)) {
-      return [...item.querySelectorAll(S.reply)]
-        .filter((m) => !(excludeSel && m.closest(excludeSel)))
-        .map((m) => textWithout(m, excludeSel)).join("\n");
+      const roots = replyRoots(item);
+      if (roots.length) {
+        return roots
+          .filter((m) => !(excludeSel && m.closest(excludeSel)))
+          .map((m) => textWithout(m, excludeSel)).join("\n");
+      }
+      return textWithout(item, withChrome(excludeSel));
     }
-    return textWithout(item, excludeSel);
+    const root = contentRoot(item);
+    const ex = root !== item || !hasOwnRole(item) ? withChrome(excludeSel) : excludeSel;
+    return textWithout(root, ex);
   }
 
   // ── DOM primitives ────────────────────────────────────────────────────────
-  const allItems = () => [...document.querySelectorAll(S.msg)];
+  // Enumerate conversation turns EXACTLY ONCE each, across both DOM generations:
+  //  • a turn container wins over the legacy message element inside it;
+  //  • nested duplicates (a message element inside a message element, a role
+  //    heading, an "edit message" editor) are never separate turns;
+  //  • nodes whose role cannot be established are skipped - never guessed.
+  function turnNodes() {
+    const out = [];
+    const seen = new Set();
+    const accept = (el) => {
+      if (!el || el.nodeType !== 1 || seen.has(el)) return;
+      // Anything INSIDE an already-accepted turn is part of that turn, not a new
+      // one (this is what keeps one turn = one item on both markups).
+      for (let p = el.parentElement; p; p = p.parentElement) if (seen.has(p)) return;
+      if (!roleOf(el)) return;
+      seen.add(el);
+      out.push(el);
+    };
+    for (const el of document.querySelectorAll(TURN_CONTAINER_SEL)) accept(el);
+    for (const el of document.querySelectorAll(LEGACY_TURN_SEL)) accept(el);
+    // Neither shape recognised: PROMOTE the role markers to their enclosing
+    // turn-sized node, so an unannounced rename still yields turns instead of
+    // silently reporting an empty conversation.
+    if (!out.length) {
+      for (const marker of document.querySelectorAll(ROLE_VALUE_SEL + "," + USER_MARKER_SEL)) {
+        const host = (marker.closest && (marker.closest(TURN_CONTAINER_SEL) || marker.closest("article,li"))) ||
+          marker.parentElement;
+        accept(host);
+      }
+    }
+    // Merged selector lists can interleave; the core relies on conversation
+    // order (item[i + 1] is the turn AFTER item[i]).
+    out.sort((a, b) => (a.compareDocumentPosition(b) & 4 /* FOLLOWING */ ? -1 : 1));
+    return out;
+  }
+
+  // Diagnostics: which turn model is live, and a loud signal when a conversation
+  // is on screen but no turn can be classified (the exact silent failure this
+  // adapter had). Throttled - allItems() is called several times per sweep.
+  let _turnModel = "", _turnModelAt = 0;
+  function noteTurnModel(items) {
+    const now = Date.now();
+    if (now - _turnModelAt < 5000) return;
+    const containers = document.querySelectorAll(TURN_CONTAINER_SEL).length;
+    const legacy = document.querySelectorAll(LEGACY_TURN_SEL).length;
+    const model = items.length ? (containers ? "container" : "legacy") : "none";
+    // When is "no turns found" a REAL problem rather than a quiet page?
+    //  - Nothing rendered at all: a fresh chat, or the instant between our own
+    //    send and the site painting the user turn. That is normal - stay quiet,
+    //    otherwise every Start would log a scary "unrecognised" breadcrumb while
+    //    the bootstrap is still in the composer.
+    //  - Rendered message bodies exist (`.markdown` / `MarkdownRoot`) but none of
+    //    them is a recognised turn: the markup changed under us. THAT is the case
+    //    that must be loud, because the agent would otherwise look like it is
+    //    silently doing nothing.
+    const rendered = (() => {
+      try {
+        return document.querySelectorAll(".markdown, [class*='MarkdownRoot'], [class*='markdown']").length;
+      } catch { return 0; }
+    })();
+    if (model === "none" && !rendered) return;
+    if (model === _turnModel && model !== "none") return;
+    _turnModel = model; _turnModelAt = now;
+    diag(model === "none" ? "turns.unrecognized" : "turns.model", {
+      model, turns: items.length, assistants: items.filter(isAssistantItem).length,
+      users: items.filter(isUserItem).length, containers, legacy,
+      // What we looked for, so a mismatch is actionable from the console alone.
+      probes: { turnKey: !!document.querySelector("[data-turn-key]"),
+                authorRole: !!document.querySelector("[data-message-author-role]"),
+                userBubble: !!document.querySelector(USER_MARKER_SEL),
+                assistantHeading: !!document.querySelector(ASSISTANT_MARKER_SEL) },
+    });
+  }
+
+  const allItems = () => {
+    const items = turnNodes();
+    noteTurnModel(items);
+    return items;
+  };
   const assistantItems = () => allItems().filter(isAssistantItem);
   const assistantCount = () => assistantItems().length;
   const userCount = () => allItems().filter(isUserItem).length;
@@ -336,8 +517,19 @@ const ZSProvider = (() => {
   // a monotonic number, so the core's numeric "old id" shortcut simply doesn't
   // apply here (Number(uuid) is NaN and that guard is skipped) - the
   // settled-history guard covers the same case provider-agnostically.
-  const itemKey = (item) =>
-    (item && item.getAttribute ? item.getAttribute("data-message-id") : null) || null;
+  const itemKey = (item) => {
+    if (!item || !item.getAttribute) return null;
+    // Container key first: it identifies the TURN on the current markup. The
+    // legacy UUID identifies the message, and is the fallback when the container
+    // has no key of its own.
+    const own = item.getAttribute("data-turn-key") || item.getAttribute("data-message-id");
+    if (own) return own;
+    // A container turn wraps the legacy element that carries the message UUID.
+    const inner = item.querySelector && item.querySelector("[data-message-id]");
+    if (inner) return inner.getAttribute("data-message-id");
+    const tid = item.getAttribute("data-testid") || "";
+    return tid.startsWith("conversation-turn-") ? tid : null;
+  };
   const lastAssistantId = () => itemKey(lastAssistant());
 
   const chatIsEmpty = () => allItems().length === 0;
@@ -441,27 +633,64 @@ const ZSProvider = (() => {
   }
 
   // ── Action buttons (send / stop) ──────────────────────────────────────────
-  // ChatGPT's composer has ONE submit control, #composer-submit-button, that
-  // FLIPS ROLE in place: data-testid="send-button" when idle,
-  // data-testid="stop-button" (aria-label "Interrompre la réponse") while
-  // generating. Validated live: the two selectors matched the SAME node. So the
-  // send button must be tested by ROLE, never by presence - otherwise
+  // On the legacy markup the composer has ONE submit control,
+  // #composer-submit-button, that FLIPS ROLE in place: data-testid="send-button"
+  // when idle, data-testid="stop-button" (aria-label "Interrompre la réponse")
+  // while generating. Validated live: the two selectors matched the SAME node. So
+  // the send button must be tested by ROLE, never by presence - otherwise
   // sendButton() cheerfully returns the stop square and every guarded click is
   // refused. That is exactly what stranded a tool result in the composer and
   // raised "ChatGPT did not accept the injected message after 4 attempts".
-  const isStopBtn = (b) => !!b && b.getAttribute("data-testid") === "stop-button";
-  const submitButton = () => {
-    const b = document.querySelector(S.submitBtn);
-    return b && b.offsetParent !== null ? b : null;
+  // The current build ships the composer's submit control with NO id and NO
+  // data-testid (a bare `button[type="submit"]`, localized aria-label), and the
+  // stop control is a separate button that only exists mid-stream. So the role is
+  // derived from the control itself - submit type / testid / aria-label / inner
+  // text - inside the composer form, with the legacy testids still honoured first
+  // for accounts that still get the old markup.
+  const STOP_LABEL_RE = /^\s*(stop|stop streaming|stop generating|stop response|arr[êe]ter|interrompre|停止|停止生成|中止|detener|parar|stoppen|beenden|остановить)\b/i;
+  const SEND_LABEL_RE = /^\s*(send|send message|send prompt|envoyer|senden|enviar|发送|送信|invia)\b/i;
+  const labelOf = (b) =>
+    ((b.getAttribute && (b.getAttribute("aria-label") || b.getAttribute("title"))) || b.innerText || b.textContent || "").trim();
+  function isStopBtn(b) {
+    if (!b || b.nodeType !== 1) return false;
+    const tid = (b.getAttribute("data-testid") || "").toLowerCase();
+    if (tid === "stop-button" || /(^|-)(stop|abort)(-|$)/.test(tid)) return true;
+    if (STOP_LABEL_RE.test(labelOf(b))) return true;
+    return false;
+  }
+  function isSendLike(b) {
+    if (!b || b.nodeType !== 1 || isStopBtn(b)) return false;
+    if (b.id === "composer-submit-button") return true;
+    const tid = (b.getAttribute("data-testid") || "").toLowerCase();
+    if (tid === "send-button" || /\bsend\b/.test(tid)) return true;
+    if ((b.getAttribute("type") || "").toLowerCase() === "submit") return true;
+    return SEND_LABEL_RE.test(labelOf(b));
+  }
+  const composerForm = () => {
+    const ed = getEditor();
+    return ed && ed.closest ? ed.closest("form") : null;
   };
-  const sendButton = () => {
-    const b = submitButton();
-    return b && !isStopBtn(b) ? b : null;
-  };
-  const stopButton = () => {
-    const b = submitButton();
-    return b && isStopBtn(b) ? b : null;
-  };
+  // Every visible control that could be the composer's send/stop, legacy first.
+  function composerButtons() {
+    const out = [];
+    try {
+      for (const b of document.querySelectorAll(S.submitBtn)) {
+        if (b.offsetParent !== null && !out.includes(b)) out.push(b);
+      }
+      const form = composerForm();
+      if (form) {
+        for (const b of form.querySelectorAll("button")) {
+          if (b.offsetParent !== null && !out.includes(b)) out.push(b);
+        }
+      }
+    } catch {}
+    return out;
+  }
+  const sendButton = () => composerButtons().find(isSendLike) || null;
+  const stopButton = () => composerButtons().find(isStopBtn) || null;
+  // Kept for the callers that only ask "is there a control at all?" (the disabled
+  // / wedge checks); send is preferred so `disabled` is read from the real one.
+  const submitButton = () => sendButton() || stopButton();
 
   // ── Generation detection ──────────────────────────────────────────────────
   // The stop button is present for the ENTIRE generation, so detection is simple.
@@ -470,7 +699,10 @@ const ZSProvider = (() => {
   // submit control stayed in its "Interrompre la réponse" role, so every send was
   // refused and the tool result was stranded in the composer). See unwedgeStop.
   function streamText(item) {
-    return item ? textWithout(item, ".zs-chip") : "";
+    if (!item) return "";
+    const roots = isAssistantItem(item) ? replyRoots(item) : [];
+    if (roots.length) return roots.map((r) => textWithout(r, ".zs-chip")).join("\n");
+    return textWithout(item, ".zs-chip");
   }
   const streamLen = (item) => streamText(item === undefined ? lastAssistant() : item).length;
 
@@ -554,7 +786,7 @@ const ZSProvider = (() => {
     try {
       const it = lastAssistant();
       if (!it) return { th: 0, rp: 0 };
-      const md = it.querySelector(S.reply);
+      const md = replyRoots(it)[0] || it;
       return { th: 0, rp: md ? (md.textContent || "").length : 0 };
     } catch { return {}; }
   }
@@ -562,10 +794,12 @@ const ZSProvider = (() => {
   function readAssistant() {
     const item = lastAssistant();
     if (!item) return { present: false, reply: "", thinking: "", item: null };
-    const mds = [...item.querySelectorAll(S.reply)];
+    const mds = replyRoots(item);
     return {
       present: true,
-      reply: mds.map((m) => textWithout(m, ".zs-chip")).join("\n").trim(),
+      reply: (mds.length
+        ? mds.map((m) => textWithout(m, ".zs-chip")).join("\n")
+        : textWithout(item, withChrome(".zs-chip"))).trim(),
       thinking: "", // reasoning is gated by the stop button, not parsed as text
       item,
     };
@@ -791,7 +1025,7 @@ const ZSProvider = (() => {
     try {
       for (const el of document.querySelectorAll(S.errorSurfaces)) {
         if (el.offsetParent === null) continue;
-        if (el.closest(S.msg)) continue; // model content, not UI chrome
+        if (el.closest(S.msg) || el.closest(TURN_CONTAINER_SEL)) continue; // model content, not UI chrome
         const t = (el.innerText || "").trim();
         if (t.length > 8 && t.length < 600 && RE.contextLimit.test(t)) return t.slice(0, 240);
       }
@@ -920,12 +1154,16 @@ const ZSProvider = (() => {
           handlers.onNativeContinue();
           return;
         }
-        // Stop is tested FIRST: it is the same node as send, just in its other
-        // role, so a stop click would otherwise read as a user send.
-        const stop = t && t.closest && t.closest(S.stopBtn);
-        if (stop) { handlers.onNativeStop(); return; }
-        const btn = t && t.closest && t.closest(S.submitBtn);
-        if (!btn || isStopBtn(btn)) return;
+        // Stop is tested FIRST: on the legacy markup it is the same node as send,
+        // just in its other role, so a stop click would otherwise read as a user
+        // send. composerButtons() covers both markups (legacy ids + the current
+        // form's bare submit / stop buttons).
+        const btn = t && t.closest && t.closest("button");
+        if (!btn) return;
+        const controls = composerButtons();
+        if (!controls.includes(btn)) return;
+        if (isStopBtn(btn)) { handlers.onNativeStop(); return; }
+        if (!isSendLike(btn)) return;
         if (handlers.isBlocked()) return;
         // Same as the keydown path: nudge, never block (see the comment there).
         if (!handlers.isStarted()) {
@@ -955,7 +1193,11 @@ const ZSProvider = (() => {
   const CMD_CLOSE = /###\s*END_(?:LUA|MCP_TOOL)\s*###/i;
 
   function findToolBlockSpot(item /*, chip */) {
-    const replies = [...item.querySelectorAll(S.reply)];
+    // The reply roots when the turn has them; otherwise the turn itself, so a
+    // container whose body is not marked .markdown still gets its command block
+    // hidden (the masking below only ever targets <pre>/<p> inside the reply).
+    const replies = replyRoots(item);
+    if (!replies.length) replies.push(item);
     let hidAny = null;
     const hide = (el, mc) => {
       el.classList.add("zs-tool-hide");
@@ -1021,6 +1263,14 @@ const ZSProvider = (() => {
     // Exported for test-chatgpt.js (the Node smoke test drives it against a stub
     // DOM). The core reads replies through itemText/classifyText, not this.
     textWithout,
+    // Test hooks: the Node suites drive the turn model and the send/stop role
+    // detection directly (they need a real DOM to be exercised honestly). The
+    // core never reads this object.
+    _test: {
+      turnNodes, roleOf, itemKey, replyRoots, contentRoot,
+      sendButton, stopButton, isStopBtn, isSendLike, composerButtons,
+      resetTurnModel() { _turnModel = ""; _turnModelAt = 0; },
+    },
     // Vision OFF, like DeepSeek's text-only Expert tab. ChatGPT's free tier caps
     // image/file input separately from messages ("les fichiers, les images et
     // l'analyse sont indisponibles jusqu'à la réinitialisation de votre quota"),
