@@ -3430,6 +3430,28 @@
       if (anchorPadEl) { try { anchorPadEl.style.paddingTop = ""; } catch {} anchorPadEl = null; }
     }
 
+    // Why is the bar not on screen? placeBar decides that every frame, and when
+    // the answer is "we could not resolve a composer" the bar simply vanishes -
+    // which is exactly the 2026-10-29 report (bar present, Start button correct
+    // and enabled, `#zs-bar` at display:none / 0x0 because ChatGPT's composer no
+    // longer matched #prompt-textarea). Report it through [zs-diag] so the next
+    // such report can be answered from the console instead of a devtools session.
+    // Throttled: placeBar runs every animation frame.
+    let lastHideReason = "", lastHideAt = 0;
+    function noteBarHidden(reason) {
+      if (reason === lastHideReason && Date.now() - lastHideAt < 10000) return;
+      lastHideReason = reason; lastHideAt = Date.now();
+      let editor = null, frame = null;
+      try { editor = P.getEditor ? !!P.getEditor() : null; } catch {}
+      try { frame = P.composerFrame ? !!P.composerFrame() : null; } catch {}
+      diag("bar.hidden", { reason, editor, frame });
+    }
+    function noteBarShown() {
+      if (!lastHideReason) return;
+      lastHideReason = ""; lastHideAt = 0;
+      diag("bar.shown", {});
+    }
+
     // Position the floating "⚠ unstable" pill just above the bar's left edge.
     function placeUnstable() {
       const u = unstableEl;
@@ -3476,6 +3498,7 @@
         bar.style.display = "none";
         clearAnchorPad();
         if (menuEl) menuEl.hidden = true;
+        noteBarHidden("captcha-or-overlay");
         return;
       }
 
@@ -3494,6 +3517,7 @@
         // when mounted ABOVE it. The provider's barMount() signals which via .inside.
         bar.classList.toggle("zs-bar-inside", !!mount.inside);
         bar.style.display = "flex";
+        noteBarShown();
         if (menuEl && !menuEl.hidden) {
           const br = bar.getBoundingClientRect();
           menuEl.style.right = Math.round(window.innerWidth - br.right) + "px";
@@ -3517,8 +3541,9 @@
         bar.classList.add("zs-bar-anchored");
         if (root && bar.parentElement !== root) root.appendChild(bar);
         const r = anchorEl.getBoundingClientRect();
-        if (!r.width) { bar.style.display = "none"; clearAnchorPad(); if (menuEl) menuEl.hidden = true; return; }
+        if (!r.width) { bar.style.display = "none"; clearAnchorPad(); if (menuEl) menuEl.hidden = true; noteBarHidden("anchor-zero-width"); return; }
         bar.style.display = "flex";
+        noteBarShown();
         const bh = bar.offsetHeight || 34;
         if (anchorPadEl && anchorPadEl !== anchorEl) clearAnchorPad();
         anchorPadEl = anchorEl;
@@ -3544,10 +3569,10 @@
         if (root && bar.parentElement !== root) root.appendChild(bar);
       }
       const f = (P.getEditor && P.getEditor()) || (P.composerFrame && P.composerFrame());
-      if (!f) { bar.style.display = "none"; if (menuEl) menuEl.hidden = true; return; }
+      if (!f) { bar.style.display = "none"; if (menuEl) menuEl.hidden = true; noteBarHidden("no-composer"); return; }
       bar.style.display = "flex";
       const r = f.getBoundingClientRect();
-      if (!r.width) { bar.style.display = "none"; return; }
+      if (!r.width) { bar.style.display = "none"; noteBarHidden("zero-width-composer"); return; }
       const w = Math.min(r.width, BAR_MAX_W);
       const left = Math.round(r.left + (r.width - w) / 2);
       const bh = bar.offsetHeight || 40;
@@ -3555,6 +3580,7 @@
       bar.style.width = w + "px";
       bar.style.left = left + "px";
       bar.style.top = top + "px";
+      noteBarShown();
       // Keep the open "more" menu anchored to the bar, opening upward.
       if (menuEl && !menuEl.hidden) {
         const br = bar.getBoundingClientRect();

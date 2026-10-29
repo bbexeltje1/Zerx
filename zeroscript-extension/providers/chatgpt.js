@@ -21,10 +21,15 @@
 //    biggest cause of failed tool calls (2026-08).
 //    Reasoning (thinking models) renders OUTSIDE .markdown, so reading only the
 //    .markdown naturally excludes drafts the model writes while reasoning.
-//  - The composer is a ProseMirror contenteditable: <div id="prompt-textarea"
-//    class="ProseMirror" contenteditable="true">. innerHTML assignment is unsafe;
-//    inject text via select-all + document.execCommand("insertText") (validated
-//    to update ProseMirror/React state and enable the send button).
+//  - The composer is a ProseMirror contenteditable. Since the 2026-09
+//    "Chat / Work" redesign it is NOT `#prompt-textarea` any more (confirmed live
+//    2026-10-29: that id returns null on a hydrated, signed-in page): it is a
+//    `div.ProseMirror[contenteditable="true"][role="textbox"]` inside the composer
+//    `<form>` (some accounts mark it `data-chatgpt-composer`). The legacy id is
+//    kept as the FIRST candidate because mobile builds still serve it - see
+//    EDITOR_CANDIDATES / getEditor(). innerHTML assignment is unsafe on either
+//    shape; inject text via select-all + document.execCommand("insertText")
+//    (validated to update ProseMirror/React state and enable the send button).
 //  - The send button is #composer-submit-button (data-testid="send-button"); it
 //    appears only once the composer has text. While generating, a stop button
 //    data-testid="stop-button" is present for the ENTIRE generation (including
@@ -67,6 +72,9 @@ const ZSProvider = (() => {
     userRole: "user",
     assistantRole: "assistant",
     reply: ".markdown",
+    // The composer editor. Not a single selector any more - see EDITOR_CANDIDATES
+    // and getEditor() below for why (ChatGPT dropped #prompt-textarea in the
+    // 2026-09 "Chat / Work" redesign).
     editor: "#prompt-textarea",
     // The ONE submit control; its data-testid says whether it is currently a
     // send or a stop button (see isStopBtn). Id first - it survives testid churn.
@@ -221,7 +229,94 @@ const ZSProvider = (() => {
   const assistantItems = () => allItems().filter(isAssistantItem);
   const assistantCount = () => assistantItems().length;
   const userCount = () => allItems().filter(isUserItem).length;
-  const getEditor = () => document.querySelector(S.editor);
+
+  // ── The composer editor ───────────────────────────────────────────────────
+  // WHY THIS IS NOT ONE SELECTOR: ChatGPT's signed-in composer lost
+  // `#prompt-textarea` in the 2026-09 "Chat / Work" redesign (confirmed live
+  // 2026-10-29: `document.querySelector("#prompt-textarea")` returns null while
+  // the page is fully hydrated and logged in). The editor is now a ProseMirror
+  // `div[contenteditable="true"][role="textbox"]` inside the composer `<form>`
+  // (some accounts ship `form[data-chatgpt-composer]`, some a bare `<form>`), and
+  // it has no id and no stable class beyond `.ProseMirror`.
+  //
+  // That single miss used to take the WHOLE bar down, not just typing: getEditor()
+  // returned null → barMount() null → no anchor → core/main.js's placeBar()
+  // could not resolve any frame to position against and set `display: none`, so
+  // the bar existed in the DOM (with a working Start button) at 0×0. "Start
+  // Roblox agent is missing" was really "the bar is hidden because we can't find
+  // the composer".
+  //
+  // Order matters: the id first (mobile/Firefox-Android and older builds still
+  // serve it), then the redesigned shapes, most specific first. Note the
+  // candidates do NOT require contenteditable="true": our own input lock flips it
+  // to "false" during startup and the bootstrap asks for the editor while it is
+  // locked, so isComposerEditor() decides editability (accepting our lock marker,
+  // rejecting a page-controlled contenteditable="false").
+  const EDITOR_CANDIDATES = [
+    S.editor, // "#prompt-textarea" - legacy / mobile builds
+    "form[data-chatgpt-composer] div.ProseMirror",
+    "form div.ProseMirror",
+    "form div[role='textbox']",
+    "[data-chatgpt-composer] div[contenteditable]",
+  ];
+
+  // A candidate must BE the conversation composer, not just any editable field.
+  // The composer always lives in the composer form (or under the
+  // data-chatgpt-composer marker); transcript editors ("edit message" opens a
+  // ProseMirror inside the turn) and unrelated editables live elsewhere.
+  function inComposerForm(el) {
+    try {
+      return !!(el.closest("form") || el.closest("[data-chatgpt-composer]"));
+    } catch { return false; }
+  }
+  // Cheap "is this actually on screen" test. Only positive evidence of hiding
+  // disqualifies a candidate: no layout engine (tests) or an in-flight React
+  // render must not be read as "hidden", or the Start control would flap.
+  function looksVisible(el) {
+    try {
+      if (el.hidden) return false;
+      if (el.getAttribute("aria-hidden") === "true") return false;
+      const cs = getComputedStyle(el);
+      if (cs && (cs.display === "none" || cs.visibility === "hidden")) return false;
+    } catch {}
+    return true;
+  }
+  function isComposerEditor(el) {
+    if (!el || el.nodeType !== 1) return false;
+    // contenteditable is "false" exactly while OUR input lock is on
+    // (setInputLock below): the bootstrap locks the composer and THEN asks the
+    // provider whether it is ready, so treating the lock as "not the composer"
+    // made ensureComposerReady() fail its own startup. The data-zs-locked marker
+    // is what keeps this precise - a page-controlled contenteditable="false"
+    // node still never matches.
+    const editable = el.getAttribute("contenteditable");
+    if (editable !== "true" && el.getAttribute("data-zs-locked") !== "1") return false;
+    if (!looksVisible(el)) return false;
+    // Never the composer: an editor rendered INSIDE a conversation turn. Both the
+    // legacy marker and the 2026-09 turn markers are checked, so an inline "edit
+    // message" box is rejected on either layout.
+    try {
+      if (el.closest("[data-message-author-role]") || el.closest("[data-turn-key]")) return false;
+    } catch { return false; }
+    return true;
+  }
+  // Re-queried on EVERY call on purpose: the composer mounts late on a cold load
+  // (and is replaced on SPA navigation), so a cached node would be the stale one.
+  function getEditor() {
+    for (const sel of EDITOR_CANDIDATES) {
+      let nodes;
+      try { nodes = document.querySelectorAll(sel); } catch { continue; }
+      for (const el of nodes) {
+        if (!isComposerEditor(el)) continue;
+        // #prompt-textarea is unambiguous; the structural fallbacks must be
+        // anchored to the composer form so a stray contenteditable (search box,
+        // sidebar rename field, transcript editor) is never mistaken for it.
+        if (sel !== "#prompt-textarea" && !inComposerForm(el)) continue;
+        return el;
+      }
+    }
+    return null;
+  }
   const editorText = () => {
     const e = getEditor();
     return e ? e.textContent || "" : "";
@@ -253,9 +348,14 @@ const ZSProvider = (() => {
     chatIsEmpty() && location.pathname === "/" && !!getEditor();
 
   // The composer box the Start gate hides as one unit (the form around the editor).
+  // 2026-09 shell: the editor's form IS the composer, without a composer-surface
+  // wrapper, so the form comes first and the old surface class is only a fallback.
   const composerFrame = () => {
     const ed = getEditor();
-    return ed ? (ed.closest("form") || ed.parentElement) : null;
+    if (!ed) return null;
+    return ed.closest("form") ||
+      ed.closest("[class*='composer-surface'],[data-chatgpt-composer]") ||
+      ed.parentElement;
   };
 
   // The scrollable band that actually shows the typed text. The editor node
@@ -310,11 +410,17 @@ const ZSProvider = (() => {
     if (!ed) return null;
     const box = ed.closest("[class*='composer-surface']");
     if (!box) return null;
+    // Only mount into the grid when we know a full-width TOP row we may claim.
+    // ChatGPT's surface is a CSS grid and a child with no (or an unknown)
+    // grid-area is AUTO-PLACED into a cell, which steals the editor's column:
+    // measured live 2026-09, that collapsed the composer to zero width. If the
+    // live template has no such row (or there is no grid at all), do NOT insert
+    // ourselves - returning null leaves the core's floating fallback to place
+    // the bar above the editor, which is always safe.
     const area = topArea(box);
-    if (area) {
-      const bar = document.getElementById("zs-bar");
-      if (bar && bar.style.gridArea !== area) bar.style.gridArea = area;
-    }
+    if (!area) return null;
+    const bar = document.getElementById("zs-bar");
+    if (bar && bar.style.gridArea !== area) bar.style.gridArea = area;
     // Skip our own bar if already mounted, otherwise we'd insert it before itself.
     let before = box.firstElementChild;
     if (before && before.id === "zs-bar") before = before.nextElementSibling;

@@ -235,8 +235,11 @@ ok("startup asks the bridge for the tool catalogue",
 (async () => {
   const clicks = [];
   const editor = {
+    nodeType: 1,
+    tagName: "DIV",
     textContent: "",
-    attrs: {},
+    attrs: { contenteditable: "true", id: "prompt-textarea" },
+    hidden: false,
     focused: false,
     focus() { this.focused = true; },
     setAttribute(k, v) { this.attrs[k] = v; },
@@ -257,9 +260,14 @@ ok("startup asks the bridge for the tool catalogue",
     click() { clicks.push(Date.now()); },
     addEventListener() {},
   };
+  // getEditor() queries the candidate list with querySelectorAll and validates
+  // each hit, so the fake composer must be served through both APIs like a real
+  // #prompt-textarea node.
+  const isEditorSel = (sel) => String(sel).includes("prompt-textarea");
   const stub = makeStub({
     document: {
-      querySelector: (sel) => (sel.includes("prompt-textarea") ? editor : sel.includes("composer-submit-button") ? sendBtn : null),
+      querySelector: (sel) => (isEditorSel(sel) ? editor : sel.includes("composer-submit-button") ? sendBtn : null),
+      querySelectorAll: (sel) => (isEditorSel(sel) ? [editor] : []),
       execCommand: (cmd, _ui, val) => {
         if (cmd === "insertText") editor.textContent += val || "";
         else if (cmd === "insertLineBreak") editor.textContent += "\n";

@@ -75,6 +75,13 @@ Smoke tests (plain Node, no dependencies - run them from this directory):
   dashboard, pairing, handoff or "prompt architect" mode. It also drives the
   ChatGPT adapter end to end against a fake composer (the bootstrap prompt is
   typed in and the send control is clicked exactly once).
+- `node test-chatgpt-composer.js` - ChatGPT composer detection
+  (`providers/chatgpt.js`): the legacy `#prompt-textarea`, the current ProseMirror
+  textbox inside the composer form (ChatGPT's 2026-09 "Chat / Work" redesign
+  removed that id), a composer that mounts after page init, and the things that
+  must never be mistaken for it (stray contenteditables, transcript "edit
+  message" editors, hidden/aria-hidden editors). Also pins `barMount()`'s refusal
+  to insert the bar into a composer grid that has no safe full-width row.
 - `node test-manifest.js` - `manifest.json`: MV3 shape, host permissions, script
   order per site (`config -> parser -> provider -> main`), every referenced file
   exists, and the manifest / background / popup / in-page switcher host lists
@@ -84,9 +91,12 @@ All of them print `PASS`/`FAIL` per case and exit non-zero on failure. They are
 mocked tests: a stub DOM and a stubbed bridge, never a live ChatGPT tab or
 Roblox Studio.
 
-For a whole-chain check without a signed-in browser (bar -> Start control ->
-bootstrap -> provider send) there is an optional jsdom probe, which needs jsdom
-installed outside the repo:
+For a whole-chain check without a signed-in browser there is an optional jsdom
+probe, which needs jsdom installed outside the repo. It boots the real content
+scripts and checks, scenario by scenario, that the bar is actually on screen with
+a non-zero rect and an enabled Start control (legacy composer, the current
+ProseMirror composer, a composer that mounts late, and a blocking overlay), then
+clicks Start and follows the bootstrap:
 
 ```
 mkdir -p /tmp/zs-probe && cd /tmp/zs-probe && npm init -y && npm i jsdom
@@ -94,9 +104,9 @@ NODE_PATH=/tmp/zs-probe/node_modules \
   node <repo>/zeroscript-extension/tools/probe-chatgpt-start.js
 ```
 
-It reports the control it found, the diag events the click produced and the
-messages sent to the bridge. Its page is synthetic and its bridge is a stub, so
-it is still not a live verification.
+It reports the bar's display/rect per scenario, the diag events the click
+produced and the messages sent to the bridge. Its page is synthetic, its layout
+is emulated and its bridge is a stub, so it is still not a live verification.
 
 ## Support
 
